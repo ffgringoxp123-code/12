@@ -1,0 +1,1338 @@
+repeat task.wait() until game:IsLoaded()
+setfpscap(9999)
+
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local VIM = game:GetService("VirtualInputManager")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local SoundService = game:GetService("SoundService")
+local StarterGui = game:GetService("StarterGui")
+local Lighting = game:GetService("Lighting")
+local StatsService = game:GetService("Stats")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BallsFolder = workspace:WaitForChild("Balls", 9e9)
+local ballStates = {}
+local ACCURACY_FACTOR = 1.285
+local statsPingItem = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]
+local basePreClick = 1.4
+local maxHorizontalMiss = 5
+local CURVE_BOOST_FACTOR = 1.3
+local CURVE_ACCEL_THRESHOLD = 60
+local SMOOTH_ALPHA = 0.3
+local CONSISTENT_FRAMES_NEEDED = 3
+local parryTimes = {}
+local parryCount = 0
+local parryHead = 1
+local ballPrevVelocity = {}
+local antiCurveData = {}
+local aggressiveMode = false
+local autoSpamRunning = false
+local autoSpamThread = nil
+local parryRemoteCache = {}
+
+local remote_eh, f_raw_eh = nil, nil
+local c_eh = {nil,nil,nil,nil,nil,nil,nil}
+local remoteHooked_eh = false
+
+local mt = getrawmetatable(game)
+local old_eh = mt.__index
+setreadonly(mt, false)
+mt.__index = newcclosure(function(self, key)
+    if key == "FireServer" or key == "InvokeServer" then
+        return function(instance, ...)
+            local args = {...}
+            if #args >= 4 then
+                remoteHooked_eh = true
+                remote_eh = instance
+                f_raw_eh = old_eh(instance, "FireServer")
+                for i = 1, 7 do c_eh[i] = args[i] end
+            end
+            return old_eh(self, key)(instance, ...)
+        end
+    end
+    return old_eh(self, key)
+end)
+setreadonly(mt, true)
+
+local cachedEvents_eh = {}
+local lastEventCache_eh = 0
+local parried_balls_eh = {}
+local AnimFix_eh = false
+
+local SwordAPI_eh = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SwordAPI")
+local lastplayedd_eh = 0
+local bypasscd_eh = false
+local AnimationDelay_eh = 1
+local AnimationCache_eh = {}
+local Grab_Parry_eh = nil
+
+local function GetHumanoid_eh()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+local function StopAnimation_eh(track)
+    track:Stop(track:GetAttribute("StopFadeTime") or 0.1)
+end
+local function PlayGrabAnimation_eh(track)
+    track:Play(track:GetAttribute("PlayFadeTime") or 0, track:GetAttribute("PlayWeight") or 1, track:GetAttribute("PlaySpeed") or 1)
+end
+local function GetParryAnimation_eh()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local currentSword = char:GetAttribute("CurrentlyEquippedSword")
+    if not currentSword then return SwordAPI_eh.Collection.Default:FindFirstChild("GrabParry") end
+    if AnimationCache_eh[currentSword] then return AnimationCache_eh[currentSword] end
+    local ok, swordData = pcall(function()
+        return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(currentSword)
+    end)
+    if not ok or type(swordData) ~= "table" then
+        AnimationCache_eh[currentSword] = SwordAPI_eh.Collection.Default:FindFirstChild("GrabParry")
+        return AnimationCache_eh[currentSword]
+    end
+    for _, obj in pairs(SwordAPI_eh.Collection:GetChildren()) do
+        if obj.Name == swordData.AnimationType then
+            local anim = obj:FindFirstChild("GrabParry") or obj:FindFirstChild("Grab")
+            if anim then AnimationCache_eh[currentSword] = anim; return anim end
+        end
+    end
+    AnimationCache_eh[currentSword] = SwordAPI_eh.Collection.Default:FindFirstChild("GrabParry")
+    return AnimationCache_eh[currentSword]
+end
+local function PlayParry_Animation_eh()
+    local humanoid = GetHumanoid_eh()
+    if not humanoid then return end
+    local animation = GetParryAnimation_eh()
+    if not animation then return end
+    for _, track in pairs(humanoid.Animator:GetPlayingAnimationTracks()) do
+        if track.Name == "GrabParry" or track.Name == "Grab" then
+            track.TimePosition = 0; StopAnimation_eh(track)
+        elseif track.Name == "SuccessParry" or track.Name == "Success" then
+            StopAnimation_eh(track)
+        end
+    end
+    Grab_Parry_eh = humanoid.Animator:LoadAnimation(animation)
+    PlayGrabAnimation_eh(Grab_Parry_eh)
+end
+local function SpamParry_Animation_eh()
+    if (os.clock() - lastplayedd_eh) >= (AnimationDelay_eh - 0.8) or bypasscd_eh then
+        lastplayedd_eh = os.clock()
+        bypasscd_eh = false
+        PlayParry_Animation_eh()
+    end
+end
+pcall(function()
+    ReplicatedStorage.Remotes.ParrySuccess.OnClientEvent:Connect(function()
+        bypasscd_eh = true
+        local humanoid = GetHumanoid_eh()
+        if humanoid then
+            for _, track in pairs(humanoid.Animator:GetPlayingAnimationTracks()) do
+                if track.Name == "GrabParry" or track.Name == "Grab" then StopAnimation_eh(track) end
+            end
+        end
+    end)
+end)
+
+local function fireParry_eh()
+    if not (remote_eh and f_raw_eh) then return end
+    local cam = workspace.CurrentCamera
+    local char = LocalPlayer.Character
+    if not char then return end
+    local camCF = cam.CFrame
+    local now = tick()
+    if now - lastEventCache_eh > 0.1 then
+        cachedEvents_eh = {}
+        local alive = workspace:FindFirstChild("Alive")
+        if alive then
+            for _, v in ipairs(alive:GetChildren()) do
+                if v ~= char and v.PrimaryPart then
+                    local sp, vis = cam:WorldToScreenPoint(v.PrimaryPart.Position)
+                    if vis then cachedEvents_eh[tostring(v)] = sp end
+                end
+            end
+        end
+        lastEventCache_eh = now
+    end
+    local vp = cam.ViewportSize
+    c_eh[3] = camCF.LookVector
+    c_eh[4] = camCF
+    c_eh[5] = cachedEvents_eh
+    c_eh[6] = {vp.X/2, vp.Y/2}
+    pcall(function() f_raw_eh(remote_eh, unpack(c_eh)) end)
+    if AnimFix_eh then task.spawn(SpamParry_Animation_eh) end
+end
+
+local AutoParry_eh = false
+
+local function AutoParryLoop_eh()
+    if not AutoParry_eh then return end
+    if not remote_eh then return end
+    local character = LocalPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    for _, ball in ipairs(BallsFolder:GetChildren()) do
+        if not ball:IsA("BasePart") then continue end
+        local bID = ball:GetDebugId()
+        if parried_balls_eh[bID] then continue end
+
+        local target = ball:GetAttribute("target")
+            or ball:GetAttribute("Target")
+            or ball:GetAttribute("targetPlayer")
+            or ball:GetAttribute("TargetPlayer")
+        local isMyBall = false
+        if target then
+            isMyBall = (target == LocalPlayer.Name)
+                or (target == LocalPlayer.UserId)
+                or (target == tostring(LocalPlayer.UserId))
+        else
+            local dist = (hrp.Position - ball.Position).Magnitude
+            if dist <= 30 then
+                local vel = ball.Velocity
+                if vel.Magnitude > 1 then
+                    local dir = (hrp.Position - ball.Position).Unit
+                    local dot = dir:Dot(vel.Unit)
+                    isMyBall = (dot > 0.4)
+                end
+            end
+        end
+
+        if isMyBall then
+            local Zoomies = ball:FindFirstChild("zoomies")
+            local shouldParry = false
+            if Zoomies then
+                local Vel = Zoomies.VectorVelocity
+                local Dir = (hrp.Position - ball.Position).Unit
+                local Dot = Dir:Dot(Vel.Unit)
+                local pingOk, pingVal = pcall(function()
+                    return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
+                end)
+                local Ping = (pingOk and pingVal or 80) / 1000
+                if Dot >= (0.3 - Ping * 0.5) then
+                    local dist = (hrp.Position - ball.Position).Magnitude
+                    local threshold = Vel.Magnitude * (Ping + 0.016) * 8 * 0.43
+                    if dist <= threshold or dist <= 9 then
+                        shouldParry = true
+                    end
+                end
+            else
+                local dist = (hrp.Position - ball.Position).Magnitude
+                local vel = ball.Velocity.Magnitude
+                if dist <= 12 and vel > 1 then shouldParry = true end
+            end
+
+            if shouldParry then
+                fireParry_eh()
+                parried_balls_eh[bID] = true
+                task.spawn(function()
+                    if target then
+                        ball:GetAttributeChangedSignal("target"):Wait()
+                    else
+                        task.wait(1.5)
+                    end
+                    parried_balls_eh[bID] = nil
+                end)
+            end
+        end
+    end
+end
+
+RunService.Stepped:Connect(AutoParryLoop_eh)
+
+local Parry_Animation_API
+pcall(function()
+    Parry_Animation_API = loadstring(game:HttpGet('https://raw.githubusercontent.com/Lose1s/Module_Wrapper/refs/heads/main/Parry_Animation.lua'))()
+end)
+
+local oldIndex
+if typeof(hookmetamethod) == "function" then
+    oldIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+        if (key == "FireServer" and self:IsA("RemoteEvent")) or (key == "InvokeServer" and self:IsA("RemoteFunction")) then
+            return function(_, ...)
+                local args = {...}
+                if #args == 7 and type(args[2]) == "string" and type(args[3]) == "number" then
+                    parryRemoteCache[self] = args
+                end
+                return oldIndex(self, key)(_, unpack(args))
+            end
+        end
+        return oldIndex(self, key)
+    end))
+end
+
+local function InitBallState(ball)
+    if ball:GetAttribute("realBall") then
+        ballStates[ball] = { parried = false }
+        ball:GetAttributeChangedSignal("target"):Connect(function()
+            if ballStates[ball] then ballStates[ball].parried = false end
+        end)
+    end
+end
+BallsFolder.ChildAdded:Connect(InitBallState)
+BallsFolder.ChildRemoved:Connect(function(ball)
+    ballStates[ball] = nil; ballPrevVelocity[ball] = nil; antiCurveData[ball] = nil
+end)
+for _, ball in ipairs(BallsFolder:GetChildren()) do InitBallState(ball) end
+
+local function ExecuteParry()
+    local camera = workspace.CurrentCamera
+    local cameraCFrame = camera and camera.CFrame or CFrame.new()
+
+    if CurrentMode == "upwards" or CurrentMode == "Up" then
+        local look = cameraCFrame.LookVector
+        local upDir = Vector3.new(look.X, 10, look.Z).Unit
+        cameraCFrame = CFrame.new(cameraCFrame.Position, cameraCFrame.Position + upDir)
+    elseif CurrentMode == "backwards" or CurrentMode == "Backward" then
+        cameraCFrame = CFrame.lookAt(cameraCFrame.Position, cameraCFrame.Position - cameraCFrame.LookVector)
+    elseif CurrentMode == "random" or CurrentMode == "Random" then
+        local randomDir = Vector3.new(math.random(-1000,1000)*0.001, math.random(-350,1000)*0.001, math.random(-1000,1000)*0.001).Unit
+        cameraCFrame = CFrame.new(cameraCFrame.Position, cameraCFrame.Position + randomDir)
+    elseif CurrentMode == "Side" then
+        local side = math.random(1,2) == 1 and 90 or -90
+        cameraCFrame = cameraCFrame * CFrame.Angles(0, math.rad(side), 0)
+    end
+
+    if next(parryRemoteCache) then
+        for remote, originalArgs in pairs(parryRemoteCache) do
+            local modifiedArgs = {originalArgs[1], originalArgs[2], 0, cameraCFrame, originalArgs[5], originalArgs[6]}
+            if remote:IsA("RemoteEvent") then
+                remote:FireServer(unpack(modifiedArgs))
+            elseif remote:IsA("RemoteFunction") then
+                remote:InvokeServer(unpack(modifiedArgs))
+            end
+        end
+    else
+        VIM:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+        VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+    end
+
+    if Parry_Animation_API then
+        pcall(function()
+            if type(Parry_Animation_API) == "function" then Parry_Animation_API()
+            elseif type(Parry_Animation_API) == "table" and Parry_Animation_API.Play then Parry_Animation_API:Play() end
+        end)
+    end
+    return true
+end
+
+local function StartManualSpam()
+    if manualSpamThread then return end
+    manualSpamRunning = true
+    manualSpamThread = task.spawn(function()
+        while manualSpamRunning do
+            local startTime = tick()
+            while tick() - startTime < 1/1000 do RunService.RenderStepped:Wait() end
+            ExecuteParry()
+        end
+        manualSpamThread = nil
+    end)
+end
+
+local function StopManualSpam()
+    manualSpamRunning = false
+    manualSpamThread = nil
+end
+
+local function StartAutoSpam()
+    if autoSpamThread then return end
+    autoSpamRunning = true
+    autoSpamThread = task.spawn(function()
+        while autoSpamRunning do
+            ExecuteParry()
+            RunService.RenderStepped:Wait()
+        end
+        autoSpamThread = nil
+    end)
+end
+
+local function StopAutoSpam()
+    autoSpamRunning = false
+    autoSpamThread = nil
+end
+
+function recordAutoParry()
+    local now = tick()
+    if parryCount < 5 then parryCount = parryCount + 1
+    else parryHead = (parryHead % 5) + 1 end
+    parryTimes[((parryHead + parryCount - 2) % 5) + 1] = now
+end
+
+local function countRecent()
+    local now = tick(); local count = 0
+    for i = 1, parryCount do
+        local idx = (parryHead + i - 2) % 5 + 1
+        if now - parryTimes[idx] < 0.5 then count = count + 1 end
+    end
+    return count
+end
+
+local function getAntiCurveMultiplier(ball, playerPos, currentVelocity)
+    local prev = ballPrevVelocity[ball]
+    if not prev then
+        ballPrevVelocity[ball] = currentVelocity
+        antiCurveData[ball] = { smoothAx = 0, smoothAy = 0, smoothAz = 0, curveFrames = 0 }
+        return 1.0
+    end
+    local ax = currentVelocity.X - prev.X; local ay = currentVelocity.Y - prev.Y; local az = currentVelocity.Z - prev.Z
+    ballPrevVelocity[ball] = currentVelocity
+    local data = antiCurveData[ball]
+    if not data then data = { smoothAx = 0, smoothAy = 0, smoothAz = 0, curveFrames = 0 }; antiCurveData[ball] = data end
+    data.smoothAy = data.smoothAy * (1 - SMOOTH_ALPHA) + ay * SMOOTH_ALPHA
+    data.smoothAz = data.smoothAz * (1 - SMOOTH_ALPHA) + az * SMOOTH_ALPHA
+    local accelMag = math.sqrt(data.smoothAx*data.smoothAx + data.smoothAy*data.smoothAy + data.smoothAz*data.smoothAz)
+    if accelMag < 0.1 then data.curveFrames = 0; return 1.0 end
+    local dx = playerPos.X - ball.Position.X; local dy = playerPos.Y - ball.Position.Y; local dz = playerPos.Z - ball.Position.Z
+    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+    if dist < 0.01 then data.curveFrames = 0; return 1.0 end
+    local unitToPlayerX = dx/dist; local unitToPlayerY = dy/dist; local unitToPlayerZ = dz/dist
+    local radialAccel = data.smoothAx*unitToPlayerX + data.smoothAy*unitToPlayerY + data.smoothAz*unitToPlayerZ
+    local lateralAccelSq = math.max(accelMag*accelMag - radialAccel*radialAccel, 0)
+    local lateralAccel = math.sqrt(lateralAccelSq)
+    if lateralAccel > CURVE_ACCEL_THRESHOLD and radialAccel > 0 then
+        data.curveFrames = data.curveFrames + 1
+        if data.curveFrames >= CONSISTENT_FRAMES_NEEDED then
+            local severity = math.min(lateralAccel / (CURVE_ACCEL_THRESHOLD * 2), 1.0)
+            return 1.0 + (CURVE_BOOST_FACTOR - 1.0) * severity
+        end
+    else data.curveFrames = 0 end
+    return 1.0
+end
+
+local function checkAutoSpam()
+    if not AutoSpam then
+        if aggressiveMode then aggressiveMode = false; StopAutoSpam() end; return end
+    local recent = countRecent(); local shouldBeAggressive = (recent >= 3)
+    if shouldBeAggressive ~= aggressiveMode then
+        aggressiveMode = shouldBeAggressive
+        if aggressiveMode then StartAutoSpam() else StopAutoSpam() end
+    end
+end
+
+local autoParryConnection = nil
+
+local function AutoParryLoop()
+    local character = LocalPlayer.Character
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return end
+
+    local playerPos = rootPart.Position
+    local px, py, pz = playerPos.X, playerPos.Y, playerPos.Z
+    local pingMs = statsPingItem:GetValue()
+    local pingFactor = math.clamp(pingMs * 0.01, 1, 20)
+
+    for _, ball in ipairs(BallsFolder:GetChildren()) do
+        if not ball:GetAttribute("realBall") then continue end
+        if ball:GetAttribute("target") ~= LocalPlayer.Name then continue end
+
+        local state = ballStates[ball]
+        if not state then InitBallState(ball); state = ballStates[ball] end
+        if state.parried then continue end
+
+        local zoomies = ball:FindFirstChild("zoomies")
+        if not zoomies then continue end
+        local velVec = zoomies.VectorVelocity
+        local vx, vy, vz = velVec.X, velVec.Y, velVec.Z
+
+        local bx, by, bz = ball.Position.X, ball.Position.Y, ball.Position.Z
+        local dx, dy, dz = px - bx, py - by, pz - bz
+        local distSq = dx*dx + dy*dy + dz*dz
+        if distSq < 1 then continue end
+        local dist = math.sqrt(distSq)
+
+        local approachSpeed = (dx*vx + dy*vy + dz*vz) / dist
+        if approachSpeed <= 0 then continue end
+
+        local horizontalSpeedSq = vx*vx + vz*vz
+        if horizontalSpeedSq > 0.001 then
+            local horizontalMiss = math.abs(dx*vz - dz*vx) / math.sqrt(horizontalSpeedSq)
+            if horizontalMiss > maxHorizontalMiss then continue end
+        end
+
+        local cappedSpeed = math.min(approachSpeed, 650)
+        local baseRadius = 2.4 + cappedSpeed * 0.002
+        local parryRadius = pingFactor + math.max(approachSpeed / (baseRadius * ACCURACY_FACTOR), 9.5)
+        local curveMultiplier = getAntiCurveMultiplier(ball, playerPos, velVec)
+        parryRadius = parryRadius * basePreClick * curveMultiplier
+
+        if dist <= parryRadius then
+            state.parried = true
+            ExecuteParry()
+            recordAutoParry()
+        end
+
+        local vel = velVec.Magnitude
+        if VLog and VLog.Parent then VLog.Text = math.floor(vel)..".0" end
+        if vel > peakVel then peakVel = vel; if PLog and PLog.Parent then PLog.Text = math.floor(peakVel)..".0" end end
+    end
+    checkAutoSpam()
+end
+
+local function SetAutoParryConnection()
+    if autoParryConnection then autoParryConnection:Disconnect(); autoParryConnection = nil end
+    if AutoParry then autoParryConnection = RunService.Stepped:Connect(AutoParryLoop) end
+end
+
+local AutoParry = false
+local ManualSpam = false
+local SpamActive = false
+local AutoSpam = false
+local CurrentMode = "None"
+local peakVel = 0
+local lastHitTick = 0
+local SPAM_INTERVAL = 1 / 250
+local lastSpamTick = 0
+local trailEnabled = false
+local espEnabled = false
+local hitSoundEnabled = false
+local musicEnabled = false
+local autoJumpEnabled = false
+local immortalEnabled = false
+local orbitEnabled = false
+local selectedTrailColor = "Rainbow"
+local orbitAngle = 0
+local hasJumped = false
+local ImmortalDesyncRadius = 40
+local ImmortalDesyncHeight = 100
+
+local hitSounds = {
+    ["UwU"] = "rbxassetid://4612696038",
+    ["Medal"] = "rbxassetid://3251785210",
+    ["Piu"] = "rbxassetid://5152762925",
+    ["Keyboard"] = "rbxassetid://3781186340",
+    ["Pop"] = "rbxassetid://4919655462",
+    ["Ding"] = "rbxassetid://4590657391",
+}
+local currentHitSound = "UwU"
+
+local musicList = {
+    ["Believer"] = "rbxassetid://938085077",
+    ["Stay"] = "rbxassetid://1215385018",
+    ["Levitating"] = "rbxassetid://6998388895",
+    ["Sunflower"] = "rbxassetid://4962735807",
+    ["Blinding Lights"] = "rbxassetid://5898558677",
+}
+local musicSound = Instance.new("Sound", SoundService)
+musicSound.SoundId = musicList["Believer"]
+musicSound.Volume = 0.3
+musicSound.Looped = true
+
+local desyncCFramePositions = {}
+local currentDesyncRotation = 0
+
+local function GenerateRandomVector(magnitude)
+    return math.random(-magnitude * 90000009292929399949949496000, magnitude * -1e9) / 5e8
+end
+
+task.spawn(function()
+    while true do
+        if immortalEnabled and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            pcall(function() LocalPlayer.Character.HumanoidRootPart:SetNetworkOwner(LocalPlayer) end)
+        end
+        task.wait()
+    end
+end)
+
+RunService.Stepped:Connect(function()
+    if immortalEnabled and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        pcall(function() LocalPlayer.Character.HumanoidRootPart:SetNetworkOwner(LocalPlayer) end)
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if immortalEnabled and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local rootPart = LocalPlayer.Character.HumanoidRootPart
+        currentDesyncRotation = (currentDesyncRotation + 15) % 360
+        desyncCFramePositions[1] = rootPart.CFrame
+        desyncCFramePositions[2] = rootPart.AssemblyLinearVelocity
+        local desyncForce = 3000
+        local spoofedCF = rootPart.CFrame * CFrame.Angles(0, math.rad(currentDesyncRotation), 0) + Vector3.new(0, ImmortalDesyncHeight, 0)
+        local hWave = math.sin(tick() * 30) * ImmortalDesyncRadius
+        local vWave = math.cos(tick() * 60) * ImmortalDesyncHeight
+        spoofedCF = spoofedCF * CFrame.new(hWave, vWave, 0) * CFrame.Angles(
+            math.rad(GenerateRandomVector(desyncForce)),
+            math.rad(GenerateRandomVector(desyncForce)),
+            0
+        )
+        rootPart.CFrame = spoofedCF
+        rootPart.AssemblyLinearVelocity = desyncCFramePositions[2] + Vector3.new(
+            math.cos(tick() * 8) * desyncForce,
+            math.cos(tick() * 8) * desyncForce,
+            0
+        )
+        RunService.RenderStepped:Wait()
+        rootPart.CFrame = desyncCFramePositions[1]
+        rootPart.AssemblyLinearVelocity = desyncCFramePositions[2]
+    end
+end)
+
+local originalCFrameIndex
+originalCFrameIndex = hookmetamethod(game, "__index", newcclosure(function(self, key)
+    if immortalEnabled and not checkcaller() then
+        if key == "CFrame" and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            if self == LocalPlayer.Character.HumanoidRootPart then
+                return desyncCFramePositions[1] or CFrame.new()
+            elseif self == LocalPlayer.Character:FindFirstChild("Head") then
+                return desyncCFramePositions[1] and desyncCFramePositions[1] + Vector3.new(0, LocalPlayer.Character.HumanoidRootPart.Size.Y / 2 + 0.5, 0) or CFrame.new()
+            end
+        end
+    end
+    return originalCFrameIndex(self, key)
+end))
+
+local pinkTheme = {
+    MainColor = Color3.fromRGB(255, 182, 193),
+    BorderColor = Color3.fromRGB(255, 105, 180),
+    DarkPink = Color3.fromRGB(200, 80, 120),
+    LightPink = Color3.fromRGB(255, 200, 210),
+    TextColor = Color3.fromRGB(255, 220, 230),
+    BgColor = Color3.fromRGB(40, 10, 20),
+    AccentPink = Color3.fromRGB(255, 150, 200)
+}
+
+local Isotopia = loadstring(game:HttpGet("https://raw.githubusercontent.com/azurelw/isotopia/refs/heads/main/loader.lua"))()
+
+local Window = Isotopia:Window({
+    Title = "kittylol",
+    Icon = "rbxassetid://104263200374555",
+    Transparent = false,
+    Size = UDim2.fromOffset(648, 429),
+    MainColor = pinkTheme.MainColor,
+    Spinning = false,
+    HideSearchBar = false,
+    Corner = 15,
+    AnimatedTitle = {
+        AnimationColor = pinkTheme.BorderColor,
+        AnimationSide = "Left",
+        AnimationSpeed = 2
+    }
+})
+Window:SetToggleKey(Enum.KeyCode.K)
+
+task.wait(1.5)
+
+local guiContainer, mainFrame
+for _, v in pairs(PlayerGui:GetChildren()) do
+    if v:IsA("ScreenGui") and v.Name ~= ScreenGui and v.Enabled then
+        guiContainer = v
+        break
+    end
+end
+
+if guiContainer then
+    for _, v in pairs(guiContainer:GetDescendants()) do
+        if v:IsA("Frame") and v.Size == UDim2.fromOffset(648, 429) then
+            mainFrame = v
+            break
+        end
+    end
+    if mainFrame then
+        -- Xoá border cũ
+        for _, v in pairs(mainFrame:GetChildren()) do
+            if v.Name == "KittyBG" or v.Name == "KittyBorderFrame" then
+                v:Destroy()
+            end
+        end
+        local bg = Instance.new("ImageLabel")
+        bg.Name = "KittyBG"
+        bg.Image = "rbxassetid://113224439839976"
+        bg.Size = UDim2.new(1, 0, 1, 0)
+        bg.Position = UDim2.new(0, 0, 0, 0)
+        bg.BackgroundTransparency = 1
+        bg.ImageTransparency = 0.2
+        bg.ScaleType = Enum.ScaleType.Crop
+        bg.ZIndex = 0
+        bg.Parent = mainFrame
+      
+        local bs = 3
+        local border = Instance.new("Frame")
+        border.Name = "KittyBorderFrame"
+        border.Size = UDim2.new(1, 0, 1, 0)
+        border.Position = UDim2.new(0, 0, 0, 0)
+        border.BackgroundTransparency = 1
+        border.ZIndex = 10
+        border.Parent = mainFrame
+        local uc = Instance.new("UICorner")
+        uc.CornerRadius = UDim.new(0, 15)
+        uc.Parent = border
+        local borders = {
+            {S = UDim2.new(1, 0, 0, bs), P = UDim2.new(0, 0, 0, 0), C = pinkTheme.BorderColor},
+            {S = UDim2.new(1, 0, 0, bs), P = UDim2.new(0, 0, 1, -bs), C = pinkTheme.BorderColor},
+            {S = UDim2.new(0, bs, 1, 0), P = UDim2.new(0, 0, 0, 0), C = Color3.fromRGB(0, 0, 0)},
+            {S = UDim2.new(0, bs, 1, 0), P = UDim2.new(1, -bs, 0, 0), C = pinkTheme.BorderColor},
+        }
+        for _, b in pairs(borders) do
+            local f = Instance.new("Frame")
+            f.Size = b.S; f.Position = b.P; f.BackgroundColor3 = b.C
+            f.BorderSize = 0; f.ZIndex = 10; f.Parent = border
+            local cuc = Instance.new("UICorner"); cuc.CornerRadius = UDim.new(0, 15); cuc.Parent = f
+        end
+        
+        -- PHÓNG TO TÊN VÀ ICON (BIG MODE)
+        for _, v in pairs(mainFrame:GetDescendants()) do
+            if v:IsA("ImageLabel") and v:IsA("GuiObject") then
+                if v.Size.X.Offset < 50 and v.Size.Y.Offset < 50 then
+                    v.Size = UDim2.new(0, 100, 0, 100)  -- Icon to như tên
+                end
+            end
+            if v:IsA("TextLabel") and v.Text == "kittylol" then
+                v.TextSize = 60                    
+                v.Size = UDim2.new(0, 340, 0, 70)    
+                v.TextColor3 = pinkTheme.TextColor
+            end
+        end
+    end
+end
+local Tab = Window:Tab({ Title = "Main", Icon = "house" })
+local Tab2 = Window:Tab({ Title = "Curve Mode", Icon = "settings" })
+local Tab3 = Window:Tab({ Title = "Stats", Icon = "activity" })
+local Tab4 = Window:Tab({ Title = "Misc", Icon = "star" })
+local Tab5 = Window:Tab({ Title = "Player", Icon = "user" })
+local Tab6 = Window:Tab({ Title = "setting", Icon = "settings" })
+
+local LeftSection = Tab:Section({ Side = "left" })
+local RightSection = Tab:Section({ Side = "right" })
+local CurveSection = Tab2:Section({ Side = "left" })
+local StatsSection = Tab3:Section({ Side = "left" })
+local MiscLeft = Tab4:Section({ Side = "left" })
+local MiscRight = Tab4:Section({ Side = "right" })
+local CombatLeft = Tab5:Section({ Side = "left" })
+local CombatRight = Tab5:Section({ Side = "right" })
+local FpsLeft = Tab6:Section({ Side = "left" })
+local FpsRight = Tab6:Section({ Side = "right" })
+
+LeftSection:Module({
+    Title = "Auto Parry",
+    Desc = "Automatically parry the ball.",
+    Flag = "auto_parry",
+    Locked = false,
+    Callback = function(state)
+        AutoParry = state
+        AutoParry_eh = state
+        table.clear(parried_balls_eh)
+        SetAutoParryConnection()
+        if not state then
+            StopAutoSpam()
+            aggressiveMode = false
+        end
+    end
+})
+
+LeftSection:Module({
+    Title = "Animation Fix",
+    Desc = "Real parry animation when blocking.",
+    Flag = "anim_fix",
+    Locked = false,
+    Callback = function(state)
+        AnimFix_eh = state
+    end
+})
+
+LeftSection:Module({
+    Title = "Auto Spam",
+    Desc = "Auto spam when parry threshold is met.",
+    Flag = "auto_spam",
+    Locked = false,
+    Callback = function(state)
+        AutoSpam = state
+        if not state then
+            StopAutoSpam()
+            aggressiveMode = false
+        end
+    end
+})
+
+LeftSection:Module({
+    Title = "Immortal",
+    Desc = "Desync-based immortality.",
+    Flag = "immortal_main",
+    Locked = false,
+    Callback = function(state)
+        immortalEnabled = state
+        if ImmortalToggleBtn then
+            ImmortalToggleBtn.Text = state and "IMMORTAL: ON" or "IMMORTAL: OFF"
+            UpdateImmortalColors(state)
+        end
+        if not state then desyncCFramePositions = {} end
+    end
+})
+
+RightSection:Module({
+    Title = "Immortal UI",
+    Desc = "Shows immortal toggle on screen.",
+    Flag = "immortal_ui_main",
+    Locked = false,
+    Callback = function(state)
+        if ImmortalFrame then
+            ImmortalFrame.Visible = state
+            if not state then
+                immortalEnabled = false
+                if ImmortalToggleBtn then
+                    ImmortalToggleBtn.Text = "IMMORTAL: OFF"
+                    UpdateImmortalColors(false)
+                end
+                desyncCFramePositions = {}
+            end
+        end
+    end
+})
+
+RightSection:Slider({
+    Title = "Desync Radius",
+    Value = { Min = 0, Max = 100, Default = 40 },
+    Flag = "desync_radius_main",
+    Locked = false,
+    Callback = function(value) ImmortalDesyncRadius = value end
+})
+
+RightSection:Slider({
+    Title = "Desync Height",
+    Value = { Min = 0, Max = 100, Default = 100 },
+    Flag = "desync_height_main",
+    Locked = false,
+    Callback = function(value) ImmortalDesyncHeight = value end
+})
+
+local SpamModule = RightSection:Module({
+    Title = "Manual Spam UI",
+    Desc = "Opens spam panel on screen.",
+    Flag = "manual_spam",
+    Locked = false,
+    Callback = function(state)
+        ManualSpam = state
+        if not state then
+            SpamActive = false
+            StopManualSpam()
+        end
+    end
+})
+
+CurveSection:Dropdown({
+    Title = "Curve Mode",
+    Values = {"None", "Random", "Camera", "Up", "Side", "Backward"},
+    Value = "None",
+    Flag = "curve_mode",
+    Locked = false,
+    Callback = function(option)
+        CurrentMode = option
+    end
+})
+
+local function MakeDraggable(frame)
+    local dragging, dragInput, dragStart, startPos
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = input.Position; startPos = frame.Position
+            input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    frame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+local function GetActiveColors(active)
+    if active then
+        return {
+            Bg = pinkTheme.BgColor,
+            Border = pinkTheme.BorderColor,
+            Text = pinkTheme.AccentPink,
+            BgTrans = 0.15
+        }
+    else
+        return {
+            Bg = Color3.fromRGB(0, 0, 0),
+            Border = Color3.fromRGB(80, 80, 80),
+            Text = Color3.fromRGB(200, 30, 100),
+            BgTrans = 0
+        }
+    end
+end
+
+local ScreenGui = Instance.new("ScreenGui", PlayerGui); ScreenGui.ResetOnSpawn = false
+
+local PFrame = Instance.new("Frame", ScreenGui)
+PFrame.Size = UDim2.new(0, 180, 0, 115); PFrame.Position = UDim2.new(0.05, 0, 0.4, 0)
+PFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0); PFrame.BackgroundTransparency = 0; PFrame.Visible = false
+Instance.new("UICorner", PFrame).CornerRadius = UDim.new(0, 15)
+local PStrokeBall = Instance.new("UIStroke", PFrame); PStrokeBall.Color = Color3.fromRGB(80, 80, 80); PStrokeBall.Thickness = 2
+local PTitle = Instance.new("TextLabel", PFrame); PTitle.Size = UDim2.new(1, 0, 0, 30); PTitle.Text = "BALL STATS"; PTitle.TextColor3 = Color3.fromRGB(180, 180, 180); PTitle.BackgroundTransparency = 1; PTitle.Font = Enum.Font.GothamBold; PTitle.TextSize = 14
+local VLabel = Instance.new("TextLabel", PFrame); VLabel.Position = UDim2.new(0.1, 0, 0.32, 0); VLabel.Size = UDim2.new(0.8, 0, 0, 12); VLabel.Text = "Velocity"; VLabel.TextColor3 = Color3.fromRGB(110, 110, 110); VLabel.BackgroundTransparency = 1; VLabel.Font = Enum.Font.Gotham; VLabel.TextSize = 12; VLabel.TextXAlignment = Enum.TextXAlignment.Left
+local VLog = Instance.new("TextLabel", PFrame); VLog.Position = UDim2.new(0.1, 0, 0.45, 0); VLog.Size = UDim2.new(0.8, 0, 0, 25); VLog.Text = "0.0"; VLog.TextColor3 = Color3.fromRGB(255, 140, 0); VLog.BackgroundTransparency = 1; VLog.Font = Enum.Font.GothamBold; VLog.TextSize = 22; VLog.TextXAlignment = Enum.TextXAlignment.Left
+local PLabel2 = Instance.new("TextLabel", PFrame); PLabel2.Position = UDim2.new(0.1, 0, 0.72, 0); PLabel2.Size = UDim2.new(0.8, 0, 0, 12); PLabel2.Text = "Peak"; PLabel2.TextColor3 = Color3.fromRGB(110, 110, 110); PLabel2.BackgroundTransparency = 1; PLabel2.Font = Enum.Font.Gotham; PLabel2.TextSize = 11; PLabel2.TextXAlignment = Enum.TextXAlignment.Left
+local PLog = Instance.new("TextLabel", PFrame); PLog.Position = UDim2.new(0.1, 0, 0.82, 0); PLog.Size = UDim2.new(0.8, 0, 0, 18); PLog.Text = "0.0"; PLog.TextColor3 = Color3.fromRGB(0, 120, 255); PLog.BackgroundTransparency = 1; PLog.Font = Enum.Font.GothamBold; PLog.TextSize = 16; PLog.TextXAlignment = Enum.TextXAlignment.Left
+MakeDraggable(PFrame, PTitle)
+
+local SpamFrame = Instance.new("Frame", ScreenGui)
+SpamFrame.Size = UDim2.new(0, 150, 0, 80); SpamFrame.Position = UDim2.new(0.4, 0, 0.5, 0)
+SpamFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0); SpamFrame.BackgroundTransparency = 0; SpamFrame.Visible = false
+Instance.new("UICorner", SpamFrame).CornerRadius = UDim.new(0, 12)
+local SpamStroke = Instance.new("UIStroke", SpamFrame); SpamStroke.Color = Color3.fromRGB(80, 80, 80); SpamStroke.Thickness = 2
+local SpamTitleLbl = Instance.new("TextLabel", SpamFrame); SpamTitleLbl.Size = UDim2.new(1, 0, 0, 25); SpamTitleLbl.Text = "Manual Spam"; SpamTitleLbl.TextColor3 = Color3.fromRGB(160, 160, 160); SpamTitleLbl.BackgroundTransparency = 1; SpamTitleLbl.Font = Enum.Font.GothamBold; SpamTitleLbl.TextSize = 12
+local SpamToggleBtn = Instance.new("TextButton", SpamFrame)
+SpamToggleBtn.Size = UDim2.new(0.85, 0, 0, 35); SpamToggleBtn.Position = UDim2.new(0.075, 0, 0, 35)
+SpamToggleBtn.Text = "SPAM: OFF"; SpamToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 15, 15)
+SpamToggleBtn.TextColor3 = Color3.new(1, 1, 1); SpamToggleBtn.Font = Enum.Font.GothamBold; SpamToggleBtn.TextSize = 13
+Instance.new("UICorner", SpamToggleBtn).CornerRadius = UDim.new(0, 8)
+MakeDraggable(SpamFrame, SpamTitleLbl)
+
+local function UpdateSpamColors(active)
+    local c = GetActiveColors(active)
+    SpamFrame.BackgroundColor3 = c.Bg
+    SpamFrame.BackgroundTransparency = c.BgTrans
+    SpamStroke.Color = c.Border
+    SpamTitleLbl.TextColor3 = c.Border
+    SpamToggleBtn.TextColor3 = active and pinkTheme.TextColor or Color3.new(1, 1, 1)
+    SpamToggleBtn.BackgroundColor3 = active and pinkTheme.DarkPink or Color3.fromRGB(45, 15, 15)
+end
+
+SpamToggleBtn.MouseButton1Click:Connect(function()
+    SpamActive = not SpamActive
+    SpamToggleBtn.Text = SpamActive and "SPAM: ON" or "SPAM: OFF"
+    UpdateSpamColors(SpamActive)
+    if SpamActive then StartManualSpam() else StopManualSpam() end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if SpamFrame.Visible ~= ManualSpam then
+        SpamFrame.Visible = ManualSpam
+        if not ManualSpam then
+            SpamActive = false
+            StopManualSpam()
+            SpamToggleBtn.Text = "SPAM: OFF"
+            UpdateSpamColors(false)
+        end
+    end
+end)
+
+local ImmortalFrame = Instance.new("Frame", ScreenGui)
+ImmortalFrame.Size = UDim2.new(0, 150, 0, 80); ImmortalFrame.Position = UDim2.new(0.4, 0, 0.65, 0)
+ImmortalFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0); ImmortalFrame.BackgroundTransparency = 0; ImmortalFrame.Visible = false
+Instance.new("UICorner", ImmortalFrame).CornerRadius = UDim.new(0, 12)
+local ImmortalStroke = Instance.new("UIStroke", ImmortalFrame); ImmortalStroke.Color = Color3.fromRGB(80, 80, 80); ImmortalStroke.Thickness = 2
+local ImmortalTitleLbl = Instance.new("TextLabel", ImmortalFrame); ImmortalTitleLbl.Size = UDim2.new(1, 0, 0, 25); ImmortalTitleLbl.Text = "Immortal"; ImmortalTitleLbl.TextColor3 = Color3.fromRGB(160, 160, 160); ImmortalTitleLbl.BackgroundTransparency = 1; ImmortalTitleLbl.Font = Enum.Font.GothamBold; ImmortalTitleLbl.TextSize = 12
+local ImmortalToggleBtn = Instance.new("TextButton", ImmortalFrame)
+ImmortalToggleBtn.Size = UDim2.new(0.85, 0, 0, 35); ImmortalToggleBtn.Position = UDim2.new(0.075, 0, 0, 35)
+ImmortalToggleBtn.Text = "IMMORTAL: OFF"; ImmortalToggleBtn.BackgroundColor3 = Color3.fromRGB(15, 15, 45)
+ImmortalToggleBtn.TextColor3 = Color3.new(1, 1, 1); ImmortalToggleBtn.Font = Enum.Font.GothamBold; ImmortalToggleBtn.TextSize = 12
+Instance.new("UICorner", ImmortalToggleBtn).CornerRadius = UDim.new(0, 8)
+MakeDraggable(ImmortalFrame, ImmortalTitleLbl)
+
+local function UpdateImmortalColors(active)
+    local c = GetActiveColors(active)
+    ImmortalFrame.BackgroundColor3 = c.Bg
+    ImmortalFrame.BackgroundTransparency = c.BgTrans
+    ImmortalStroke.Color = c.Border
+    ImmortalTitleLbl.TextColor3 = c.Border
+    ImmortalToggleBtn.TextColor3 = active and pinkTheme.TextColor or Color3.new(1, 1, 1)
+    ImmortalToggleBtn.BackgroundColor3 = active and pinkTheme.DarkPink or Color3.fromRGB(15, 15, 45)
+end
+
+ImmortalToggleBtn.MouseButton1Click:Connect(function()
+    immortalEnabled = not immortalEnabled
+    ImmortalToggleBtn.Text = immortalEnabled and "IMMORTAL: ON" or "IMMORTAL: OFF"
+    UpdateImmortalColors(immortalEnabled)
+end)
+
+StatsSection:Module({
+    Title = "Show Peak (Ball Star)",
+    Desc = "Show ball velocity and peak speed on screen.",
+    Flag = "show_peak",
+    Locked = false,
+    Callback = function(state)
+        PFrame.Visible = state
+    end
+})
+
+CombatLeft:Module({
+    Title = "Auto Jump",
+    Desc = "Jump once then stop.",
+    Flag = "auto_jump",
+    Locked = false,
+    Callback = function(state)
+        autoJumpEnabled = state
+        hasJumped = false
+    end
+})
+
+CombatLeft:Module({
+    Title = "Orbit (Around Self)",
+    Desc = "Parts orbit around you.",
+    Flag = "orbit",
+    Locked = false,
+    Callback = function(state)
+        orbitEnabled = state
+        if not state then
+            for _, v in pairs(ScreenGui:GetChildren()) do
+                if v.Name == "OrbitPart" then v:Destroy() end
+            end
+        end
+    end
+})
+
+CombatRight:Slider({
+    Title = "FOV",
+    Value = { Min = 70, Max = 200, Default = 70 },
+    Flag = "fov_slider",
+    Locked = false,
+    Callback = function(value)
+        workspace.CurrentCamera.FieldOfView = value
+    end
+})
+
+local trailModule = MiscLeft:Module({
+    Title = "Ball Trail",
+    Desc = "Trail effect on the ball.",
+    Flag = "ball_trail",
+    Locked = false,
+    Callback = function(state) trailEnabled = state end
+})
+trailModule:Dropdown({
+    Title = "Trail Color",
+    Values = {"Rainbow", "Blue", "Yellow", "Green", "Pink", "Cyan"},
+    Value = "Rainbow",
+    Flag = "trail_color",
+    Locked = false,
+    Callback = function(option) selectedTrailColor = option end
+})
+
+MiscLeft:Module({
+    Title = "Player ESP",
+    Desc = "Show player names above heads.",
+    Flag = "esp_enabled",
+    Locked = false,
+    Callback = function(state)
+        espEnabled = state
+        if not state then
+            for _, p in pairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then
+                    local head = p.Character:FindFirstChild("Head")
+                    if head then
+                        local bb = head:FindFirstChild("KittyESP")
+                        if bb then bb:Destroy() end
+                    end
+                end
+            end
+        end
+    end
+})
+
+local hitModule = MiscRight:Module({
+    Title = "Hit Sound",
+    Desc = "Sound when you parry the ball.",
+    Flag = "hit_sound",
+    Locked = false,
+    Callback = function(state) hitSoundEnabled = state end
+})
+hitModule:Dropdown({
+    Title = "Sound",
+    Values = {"UwU", "Medal", "Piu", "Keyboard", "Pop", "Ding"},
+    Value = "UwU",
+    Flag = "sound_type",
+    Locked = false,
+    Callback = function(option) currentHitSound = option end
+})
+hitModule:Slider({
+    Title = "Hit Volume",
+    Value = { Min = 0, Max = 100, Default = 80 },
+    Flag = "hit_vol",
+    Locked = false,
+    Callback = function(value) end
+})
+
+local musicModule = MiscRight:Module({
+    Title = "Music",
+    Desc = "Background music.",
+    Flag = "music_enabled",
+    Locked = false,
+    Callback = function(state)
+        musicEnabled = state
+        if state then musicSound:Play() else musicSound:Stop() end
+    end
+})
+musicModule:Dropdown({
+    Title = "Song",
+    Values = {"Believer", "Stay", "Levitating", "Sunflower", "Blinding Lights"},
+    Value = "Believer",
+    Flag = "music_song",
+    Locked = false,
+    Callback = function(option)
+        musicSound.SoundId = musicList[option] or musicList["Believer"]
+        if musicEnabled then musicSound:Stop(); musicSound:Play() end
+    end
+})
+musicModule:Slider({
+    Title = "Music Volume",
+    Value = { Min = 0, Max = 100, Default = 30 },
+    Flag = "music_vol",
+    Locked = false,
+    Callback = function(value) musicSound.Volume = value / 100 end
+})
+
+FpsLeft:Module({
+    Title = "Anti Lag (Strong)",
+    Desc = "Maximum FPS boost.",
+    Flag = "anti_lag",
+    Locked = false,
+    Callback = function(state)
+        if state then
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = math.huge
+            Lighting.FogStart = math.huge
+            for _, v in pairs(workspace:GetDescendants()) do
+                pcall(function()
+                    if v:IsA("ParticleEmitter") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles") then
+                        v.Enabled = false
+                    end
+                    if v:IsA("Texture") or v:IsA("Decal") then
+                        v.Transparency = 1
+                    end
+                end)
+            end
+        else
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+            Lighting.GlobalShadows = true
+            Lighting.FogEnd = 100000
+            Lighting.FogStart = 0
+            for _, v in pairs(workspace:GetDescendants()) do
+                pcall(function()
+                    if v:IsA("ParticleEmitter") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles") then
+                        v.Enabled = true
+                    end
+                    if v:IsA("Texture") or v:IsA("Decal") then
+                        v.Transparency = 0
+                    end
+                end)
+            end
+        end
+    end
+})
+
+FpsLeft:Module({
+    Title = "Disable Shadows",
+    Desc = "Turns off all shadows.",
+    Flag = "no_shadows",
+    Locked = false,
+    Callback = function(state) Lighting.GlobalShadows = not state end
+})
+
+FpsLeft:Module({
+    Title = "Disable Fog",
+    Desc = "Removes fog.",
+    Flag = "no_fog",
+    Locked = false,
+    Callback = function(state)
+        Lighting.FogEnd = state and math.huge or 100000
+        Lighting.FogStart = state and math.huge or 0
+    end
+})
+
+FpsLeft:Module({
+    Title = "No Particles",
+    Desc = "Removes all particle effects.",
+    Flag = "no_particles",
+    Locked = false,
+    Callback = function(state)
+        for _, v in pairs(workspace:GetDescendants()) do
+            pcall(function()
+                if v:IsA("ParticleEmitter") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles") then
+                    v.Enabled = not state
+                end
+            end)
+        end
+    end
+})
+
+FpsRight:Slider({
+    Title = "Graphics Level",
+    Value = { Min = 1, Max = 10, Default = 10 },
+    Flag = "gfx_quality",
+    Locked = false,
+    Callback = function(value) settings().Rendering.QualityLevel = value end
+})
+
+FpsRight:Module({
+    Title = "Hide Roblox UI",
+    Desc = "Hides Roblox UI for FPS boost.",
+    Flag = "hide_ui",
+    Locked = false,
+    Callback = function(state)
+        StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, not state)
+    end
+})
+
+FpsRight:Module({
+    Title = "Disable Animations",
+    Desc = "Removes player animations.",
+    Flag = "no_anim",
+    Locked = false,
+    Callback = function(state)
+        local char = LocalPlayer.Character
+        if char then
+            local animate = char:FindFirstChild("Animate")
+            if animate then animate.Disabled = state end
+        end
+    end
+})
+
+Window:load()
+
+local rainbowColors = {
+    Color3.fromRGB(255, 0, 0), Color3.fromRGB(255, 165, 0),
+    Color3.fromRGB(255, 255, 0), Color3.fromRGB(0, 255, 0),
+    Color3.fromRGB(0, 0, 255), Color3.fromRGB(255, 0, 255),
+    Color3.fromRGB(0, 255, 255), Color3.fromRGB(255, 105, 180),
+}
+local colorOptions = {
+    Blue = Color3.fromRGB(0, 120, 255), Yellow = Color3.fromRGB(255, 220, 0),
+    Green = Color3.fromRGB(0, 255, 100), Pink = Color3.fromRGB(255, 105, 180),
+    Cyan = Color3.fromRGB(0, 255, 255),
+}
+local colorIndex = 1
+
+local function addTrail(ball, color)
+    if not ball:FindFirstChild("KittyTrail") then
+        local att0 = Instance.new("Attachment", ball); att0.Name = "TrailAtt0"; att0.Position = Vector3.new(0, 1, 0)
+        local att1 = Instance.new("Attachment", ball); att1.Name = "TrailAtt1"; att1.Position = Vector3.new(0, -1, 0)
+        local trail = Instance.new("Trail", ball); trail.Name = "KittyTrail"
+        trail.Attachment0 = att0; trail.Attachment1 = att1
+        trail.Lifetime = 0.5; trail.MinLength = 0
+        trail.Transparency = NumberSequence.new(0, 1); trail.LightEmission = 0.5
+    end
+    local t = ball:FindFirstChild("KittyTrail")
+    if t and typeof(color) == "Color3" then t.Color = ColorSequence.new(color) end
+end
+
+local function removeTrail(ball)
+    if ball:FindFirstChild("KittyTrail") then ball.KittyTrail:Destroy() end
+    if ball:FindFirstChild("TrailAtt0") then ball.TrailAtt0:Destroy() end
+    if ball:FindFirstChild("TrailAtt1") then ball.TrailAtt1:Destroy() end
+end
+
+local orbitParts = {}
+local function setupOrbit()
+    for _, v in pairs(orbitParts) do pcall(function() v:Destroy() end) end
+    orbitParts = {}
+    local orbitColors = {
+        Color3.fromRGB(0, 255, 255), Color3.fromRGB(255, 0, 255),
+        Color3.fromRGB(255, 255, 0), Color3.fromRGB(0, 255, 0),
+    }
+    for i = 1, 4 do
+        local part = Instance.new("Part", workspace)
+        part.Name = "KittyOrbit"
+        part.Size = Vector3.new(0.5, 0.5, 0.5)
+        part.Anchored = true
+        part.CanCollide = false
+        part.BrickColor = BrickColor.new(orbitColors[i])
+        part.Material = Enum.Material.Neon
+        part.CastShadow = false
+        table.insert(orbitParts, part)
+    end
+end
+
+local function playHitSound(vol)
+    local s = Instance.new("Sound", SoundService)
+    s.SoundId = hitSounds[currentHitSound] or hitSounds["UwU"]
+    s.Volume = vol / 100
+    s:Play()
+    game:GetService("Debris"):AddItem(s, 2)
+end
+
+RunService.RenderStepped:Connect(function()
+    colorIndex = colorIndex % #rainbowColors + 1
+
+    for _, v in pairs(workspace:GetChildren()) do
+        if v:IsA("BasePart") and (v.Name:lower():find("ball") or v:GetAttribute("Ball")) then
+            if trailEnabled then
+                local color = selectedTrailColor == "Rainbow" and rainbowColors[colorIndex] or colorOptions[selectedTrailColor]
+                addTrail(v, color)
+                if selectedTrailColor == "Rainbow" then
+                    local t = v:FindFirstChild("KittyTrail")
+                    if t then t.Color = ColorSequence.new(rainbowColors[colorIndex]) end
+                end
+            else removeTrail(v) end
+        end
+    end
+
+    
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local head = p.Character:FindFirstChild("Head")
+            if head then
+                local bb = head:FindFirstChild("KittyESP")
+                if espEnabled then
+                    if not bb then
+                        local billboard = Instance.new("BillboardGui", head)
+                        billboard.Name = "KittyESP"; billboard.Size = UDim2.new(0, 200, 0, 50)
+                        billboard.AlwaysOnTop = true; billboard.ExtentsOffset = Vector3.new(0, 3, 0)
+                        local label = Instance.new("TextLabel", billboard)
+                        label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
+                        label.Text = p.DisplayName; label.TextColor3 = Color3.new(1, 1, 1)
+                        label.Font = Enum.Font.GothamBold; label.TextSize = 18
+                        label.TextStrokeTransparency = 0; label.TextStrokeColor3 = Color3.new(0, 0, 0)
+                    end
+                else
+                    if bb then bb:Destroy() end
+                end
+            end
+        end
+    end
+
+    -- Auto Jump
+    if autoJumpEnabled and not hasJumped then
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.FloorMaterial ~= Enum.Material.Air then
+                hum.Jump = true
+                hasJumped = true
+                task.delay(1, function() hasJumped = false end)
+            end
+        end
+    end
+
+    -- Orbit
+    if orbitEnabled then
+        orbitAngle = orbitAngle + 0.05
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            if #orbitParts == 0 then setupOrbit() end
+            local radius = 4
+            local positions = {
+                Vector3.new(math.cos(orbitAngle) * radius, 0, math.sin(orbitAngle) * radius),
+                Vector3.new(math.cos(orbitAngle + math.pi) * radius, 0, math.sin(orbitAngle + math.pi) * radius),
+                Vector3.new(0, math.sin(orbitAngle) * radius, math.cos(orbitAngle) * radius),
+                Vector3.new(0, math.cos(orbitAngle) * radius, math.sin(orbitAngle + math.pi/2) * radius),
+            }
+            for i, part in pairs(orbitParts) do
+                if part and part.Parent then
+                    part.CFrame = CFrame.new(hrp.Position + positions[i])
+                end
+            end
+        end
+    else
+        if #orbitParts > 0 then
+            for _, v in pairs(orbitParts) do pcall(function() v:Destroy() end) end
+            orbitParts = {}
+        end
+    end
+end)
+
+-- Hit Sound khi Parry thành công
+local ParrySuccessRemote = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game:GetService("ReplicatedStorage").Remotes:FindFirstChild("ParrySuccess")
+if ParrySuccessRemote then
+    ParrySuccessRemote.OnClientEvent:Connect(function()
+        if hitSoundEnabled then playHitSound(80) end
+    end)
+end
+
+print("✅ Kittylol Hub loaded! | setfpscap(9999) | Big Title & Icon | Immortal on MAIN tab | Pink theme")
